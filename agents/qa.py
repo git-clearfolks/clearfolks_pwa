@@ -1,129 +1,145 @@
 #!/usr/bin/env python3
 """
-QA Agent — checks all published PWAs for broken onclick handlers.
-Reports missing functions, incomplete HTML, and common issues.
-"""
+QA Agent — functional test suite for the Clearfolks PWAs.
 
-import os
+This is the second-generation qa.py. The first generation only grep'd for
+function names in HTML, which let "Save button does nothing" bugs through —
+the grep saw `function saveVendor` but never proved it grew state or that
+the rendered list updated. This rewrite shells out to qa_runner.js (Node +
+jsdom), which boots each PWA's actual page, runs its actual JS, and exercises
+real flows: navigation, form save, render-after-save, persistence, delete,
+and export.
+
+Two callable surfaces:
+
+    # CLI — same human-readable summary as the previous qa.py
+    python3 qa.py
+
+    # Programmatic — Forge calls this before deploy()
+    from qa import run_functional_qa
+    result = run_functional_qa(slug, html_path)
+    if not result["passed"]: ...
+
+The runner needs a jsdom install at /tmp/node_modules/jsdom (already present
+on the droplet from earlier work; the runner will print a clear error if it
+ever goes missing).
+"""
+import argparse
 import json
-import re
+import os
+import subprocess
+import sys
 from pathlib import Path
 
-PRODUCTS_FILE = "/root/clearfolks/products.json"
+CLEARFOLKS_HOME = Path(os.environ.get("CLEARFOLKS_HOME", "/root/clearfolks"))
+PRODUCTS_FILE = CLEARFOLKS_HOME / "products.json"
 WWW_ROOT = "/var/www/clearfolk"
+QA_RUNNER = CLEARFOLKS_HOME / "qa_runner.js"
 
-def qa_check(slug, name):
-    path = f"{WWW_ROOT}/{slug}/index.html"
-    issues = []
-    
-    if not os.path.exists(path):
-        return [f"CRITICAL: index.html missing at {path}"]
 
-    with open(path) as f:
-        html = f.read()
+def run_functional_qa(slug: str, html_path: str | None = None, timeout: int = 60) -> dict:
+    """Run the jsdom-based test suite against a single product.
 
-    # Check HTML is complete
-    if not html.strip().endswith("</html>"):
-        issues.append("CRITICAL: HTML file is incomplete — missing </html>")
+    Returns a dict shaped like:
+        {
+            "slug": "<slug>",
+            "passed": True|False,
+            "tests": [{"name": "Navigation", "ok": True, "detail": "…"}, …],
+            "failures": ["Form save — …", …],   # convenience flat list
+            "error": "<runner-level error>"     # only on infra failure
+        }
+    """
+    cmd = ["node", str(QA_RUNNER), "--slug", slug, "--json"]
+    if html_path:
+        cmd += ["--html", html_path]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"slug": slug, "passed": False, "tests": [], "failures": [f"Runner timeout after {timeout}s"], "error": "timeout"}
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {
+            "slug": slug,
+            "passed": False,
+            "tests": [],
+            "failures": [proc.stderr.strip() or proc.stdout.strip() or "runner emitted no JSON"],
+            "error": "json_decode",
+        }
+    data.setdefault("failures", [])
+    for t in data.get("tests", []):
+        if not t.get("ok"):
+            data["failures"].append(f"{t['name']} — {t.get('detail', 'failed')}")
+    return data
 
-    # Check </body> exists
-    if "</body>" not in html:
-        issues.append("CRITICAL: Missing </body> tag — JS likely cut off")
 
-    # Check <script> tag exists
-    if "<script>" not in html and "<script " not in html:
-        issues.append("CRITICAL: No <script> tag found — no JavaScript")
+def print_human(result: dict, product_meta: dict | None = None) -> None:
+    flag = "PASS" if result.get("passed") else "FAIL"
+    label = product_meta["name"] if product_meta else result.get("slug", "")
+    pid = product_meta["id"] if product_meta else ""
+    print(f"[{flag}] {pid}{' — ' if pid else ''}{label}")
+    if product_meta and "url" in product_meta:
+        print(f"  URL: {product_meta['url']}")
+    for t in result.get("tests", []):
+        mark = "✓" if t.get("ok") else "✗"
+        print(f"  {mark} {t['name']} — {t.get('detail', '')}")
+    if result.get("error"):
+        print(f"  !! runner error: {result['error']}")
+    print()
 
-    # Extract all onclick functions called
-    onclick_calls = re.findall(r"onclick=[\"'](?!if|for|while|switch)(\w+)\(", html)
-    onclick_functions = set(onclick_calls)
-
-    # Extract all defined functions
-    defined_functions = set(re.findall(r"function (\w+)\s*\(", html))
-
-    # Check each onclick function is defined
-    missing = onclick_functions - defined_functions
-    for fn in sorted(missing):
-        issues.append(f"MISSING FUNCTION: {fn}() is called but never defined")
-
-    # Check switchSection or equivalent nav function exists
-    if "switchSection" in html and "function switchSection" not in html:
-        issues.append("MISSING FUNCTION: switchSection() — navigation will be broken")
-
-    # Check localStorage usage
-    if "localStorage" not in html:
-        issues.append("WARNING: No localStorage usage — data won't persist")
-
-    # Check service worker
-    if "serviceWorker" not in html:
-        issues.append("WARNING: No service worker registration")
-
-    # Check brand footer
-    if "clearfolks.com" not in html:
-        issues.append("WARNING: Missing brand footer")
-
-    # Check manifest
-    if "manifest.json" not in html:
-        issues.append("WARNING: Missing manifest link")
-
-    return issues
 
 def main():
-    if not os.path.exists(PRODUCTS_FILE):
-        print("ERROR: products.json not found")
-        return
+    parser = argparse.ArgumentParser(description="Functional QA for Clearfolks PWAs")
+    parser.add_argument("--slug", help="check only this slug (default: all from products.json)")
+    parser.add_argument("--html", help="alternate index.html path (forge pre-deploy gate)")
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument("--timeout", type=int, default=60, help="per-product runner timeout (s)")
+    args = parser.parse_args()
 
-    with open(PRODUCTS_FILE) as f:
-        data = json.load(f)
+    if not QA_RUNNER.exists():
+        print(f"ERROR: qa_runner.js missing at {QA_RUNNER}", file=sys.stderr)
+        sys.exit(2)
 
-    products = data.get("products", [])
-    print(f"QA checking {len(products)} products...\n")
-
-    all_clear = True
-    results = []
-
-    for p in products:
-        name = p["name"]
-        slug = p["slug"]
-        url = p["url"]
-        issues = qa_check(slug, name)
-
-        status = "PASS" if not issues else "FAIL"
-        if issues:
-            all_clear = False
-
-        results.append({
-            "id": p["id"],
-            "name": name,
-            "slug": slug,
-            "url": url,
-            "status": status,
-            "issues": issues
-        })
-
-        print(f"[{status}] {p['id']} — {name}")
-        print(f"  URL: {url}")
-        if issues:
-            for issue in issues:
-                prefix = "  !! " if "CRITICAL" in issue else "  >> "
-                print(f"{prefix}{issue}")
-        print()
-
-    print("=" * 60)
-    passed = len([r for r in results if r["status"] == "PASS"])
-    failed = len([r for r in results if r["status"] == "FAIL"])
-    print(f"Results: {passed} passed, {failed} failed")
-
-    if all_clear:
-        print("All products passed QA.")
+    if args.slug:
+        products = [{"slug": args.slug, "name": args.slug, "id": "", "url": ""}]
     else:
-        print("\nFix CRITICAL issues before listing on Etsy.")
+        if not PRODUCTS_FILE.exists():
+            print(f"ERROR: {PRODUCTS_FILE} not found", file=sys.stderr)
+            sys.exit(2)
+        products = json.loads(PRODUCTS_FILE.read_text())["products"]
 
-    # Save QA report
-    report_path = "/root/clearfolks/logs/qa-report.json"
-    with open(report_path, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"\nReport saved: {report_path}")
+    print(f"QA checking {len(products)} product(s)...\n")
+
+    results = []
+    for p in products:
+        slug = p["slug"]
+        html = args.html or f"{WWW_ROOT}/{slug}/index.html"
+        r = run_functional_qa(slug, html_path=html, timeout=args.timeout)
+        r["product"] = {"id": p.get("id", ""), "name": p.get("name", slug), "url": p.get("url", "")}
+        results.append(r)
+        if not args.json:
+            print_human(r, r["product"])
+
+    passed = sum(1 for r in results if r.get("passed"))
+    failed = len(results) - passed
+    if not args.json:
+        print("=" * 60)
+        print(f"Results: {passed} passed, {failed} failed\n")
+        if failed == 0:
+            print("All products passed functional QA.")
+        else:
+            print("Fix functional failures before listing on Etsy.")
+
+    report = CLEARFOLKS_HOME / "logs" / "qa-report.json"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(json.dumps(results, indent=2))
+    if not args.json:
+        print(f"\nReport saved: {report}")
+    else:
+        print(json.dumps(results, indent=2))
+
+    sys.exit(0 if failed == 0 else 1)
+
 
 if __name__ == "__main__":
     main()

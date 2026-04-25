@@ -4,10 +4,18 @@ Forge — PWA Builder Agent (two-pass: HTML first, then JS)
 Usage: forge.py "Product Name" | forge.py --next | forge.py --list
 """
 
-import os, sys, json, random, subprocess, re
+import os, sys, json, random, subprocess, re, time, tempfile
 from datetime import datetime
 import urllib.request, urllib.parse
 import anthropic
+
+# Functional QA — used as a mandatory deploy gate further down. Imported
+# lazily so a missing qa.py doesn't break unrelated forge invocations
+# (forge --list shouldn't load qa).
+def _import_qa():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from qa import run_functional_qa
+    return run_functional_qa
 
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -32,8 +40,10 @@ DESIGN RULES:
 - PWA meta tags, manifest link, apple touch icon
 - Brand footer: "Made by Clearfolk · Practical tools for life's complicated moments · clearfolks.com"
 - All sections present but hidden (display:none) except first
-- Use onclick="app.METHOD()" pattern for ALL interactive elements
+- Use onclick="METHOD()" for ALL interactive elements — call global functions by bare name, NO "app." prefix anywhere
 - Minimum 5 nav sections + Export section
+- Keep CSS compact: reuse utility classes, no decorative extras
+- Target total file size under 40KB — prioritize working structure over visual flourishes
 
 PRODUCT: {NAME}
 CATEGORY: {CATEGORY}
@@ -46,18 +56,27 @@ JS_PROMPT = '''You are Forge, completing a PWA for Clearfolks Templates.
 PASS 2 — Generate ONLY the JavaScript for this PWA.
 The HTML structure already exists. Your JS will be injected into <script id="app-script">.
 
-ALL functions must be methods on a single global object: const app = {{ ... }}
-This prevents naming conflicts. HTML uses onclick="app.METHOD()"
+ALL functions must be declared at top level with `function NAME() {{ ... }}`.
+HTML uses `onclick="METHOD()"` — bare calls, NO `app.` prefix, NO object wrapping.
 
 REQUIREMENTS:
-- Single global object: const app = {{ switchSection, openModal, closeModal, save, load, render*, export* }}
+- Top-level declarations only: `function switchSection(name) {{...}}`, `function openModal(id) {{...}}`, etc.
+- Keep shared mutable state in a single top-level `let state = {{...}}` variable, NOT on an `app` object.
 - localStorage key: "{STORAGE_KEY}"
-- Initial state object with all data arrays
 - switchSection(name) — hide all .section, show matching one, update nav active state
 - Full CRUD for each data type
-- Export to CSV for each data type
+- Export to CSV
 - importData() and clearAllData()
-- Call app.init() at the end to load data and render
+- At the bottom of the script, immediately invoke load() and render the first section — no app.init wrapper.
+- Also register the service worker: `if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');`
+
+MANDATORY CONTRACT — you MUST declare every one of these functions at top level,
+with behavior that matches its name. Missing any of them = build failure:
+{REQUIRED_FNS}
+
+The HTML references these element IDs via document.getElementById. Read/write
+them by exactly these IDs; do not invent new IDs or rename existing ones:
+{ELEMENT_IDS}
 
 PRODUCT: {NAME}
 SECTIONS: {SECTIONS}
@@ -84,13 +103,37 @@ def extract_data_types(html):
     inputs = re.findall(r'id="(\w+)Input"', html)
     return list(set([re.sub(r'(Name|Title|Date|Amount|Notes|Status|Type)$', '', i) for i in inputs if len(i) > 4]))
 
+def extract_onclick_fns(html):
+    """Return every bare function name referenced from onclick= in the HTML."""
+    return sorted(set(re.findall(r'onclick="(\w+)\(', html)))
+
+def extract_element_ids(html):
+    """Return every id on an <input>, <select>, or <textarea> in the HTML."""
+    pattern = re.compile(r'<(?:input|select|textarea)\b[^>]*\bid="([^"]+)"', re.IGNORECASE)
+    return sorted(set(pattern.findall(html)))
+
 def call_claude(prompt, max_tokens=6000):
-    msg = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return msg.content[0].text.strip()
+    last_err = None
+    for attempt in range(4):
+        try:
+            chunks = []
+            with client.messages.stream(
+                model="claude-sonnet-4-5",
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            ) as stream:
+                for text in stream.text_stream:
+                    chunks.append(text)
+            return "".join(chunks).strip()
+        except (anthropic.APIStatusError, anthropic.APIConnectionError) as e:
+            last_err = e
+            status = getattr(e, "status_code", None)
+            if status is not None and status < 500 and status != 429:
+                raise
+            wait = 30 * (2 ** attempt)
+            print(f"  API error ({status or type(e).__name__}) — retrying in {wait}s (attempt {attempt + 1}/4)")
+            time.sleep(wait)
+    raise last_err
 
 def clean_code(text, expected="html"):
     text = re.sub(r'^```\w*\n?', '', text)
@@ -165,7 +208,7 @@ def build(category_data, force_slug=None):
     # Pass 1 — HTML + CSS
     print("  Pass 1: Generating HTML structure...")
     html_prompt = HTML_PROMPT.replace("{NAME}", name).replace("{CATEGORY}", category).replace("{PAIN}", pain)
-    html = clean_code(call_claude(html_prompt, max_tokens=5000))
+    html = clean_code(call_claude(html_prompt, max_tokens=32000))
 
     issues = qa_check(html)
     if issues:
@@ -178,14 +221,20 @@ def build(category_data, force_slug=None):
     # Extract structure for JS generation
     sections = extract_sections(html)
     data_types = extract_data_types(html)
+    required_fns = extract_onclick_fns(html)
+    element_ids = extract_element_ids(html)
     print(f"  Sections: {sections}")
     print(f"  Data types: {data_types}")
+    print(f"  Required fns ({len(required_fns)}): {required_fns}")
+    print(f"  Element ids ({len(element_ids)})")
 
     # Pass 2 — JavaScript
     print("  Pass 2: Generating JavaScript...")
     js_prompt = JS_PROMPT.replace("{NAME}", name).replace("{STORAGE_KEY}", storage_key)
     js_prompt = js_prompt.replace("{SECTIONS}", str(sections)).replace("{DATA_TYPES}", str(data_types))
-    js = clean_code(call_claude(js_prompt, max_tokens=5000), "js")
+    js_prompt = js_prompt.replace("{REQUIRED_FNS}", "\n".join(f"  - {fn}" for fn in required_fns))
+    js_prompt = js_prompt.replace("{ELEMENT_IDS}", ", ".join(element_ids) if element_ids else "(none)")
+    js = clean_code(call_claude(js_prompt, max_tokens=32000), "js")
 
     # Inject JS into HTML
     final_html = html.replace(
@@ -195,7 +244,7 @@ def build(category_data, force_slug=None):
 
     # Final QA
     missing_fns = []
-    onclick_calls = set(re.findall(r'onclick="app\.(\w+)\(', final_html))
+    onclick_calls = set(re.findall(r'onclick="(\w+)\(', final_html))
     for fn in onclick_calls:
         if fn not in js:
             missing_fns.append(fn)
@@ -204,6 +253,55 @@ def build(category_data, force_slug=None):
         print(f"  WARNING: Missing JS functions: {missing_fns}")
     else:
         print(f"  JS QA: all {len(onclick_calls)} functions present")
+
+    # ------------------------------------------------------------------
+    # Functional QA — mandatory deploy gate.
+    #
+    # Boots the candidate HTML in jsdom and exercises the real flows
+    # (navigation, form save, render-after-save, persistence, delete,
+    # export). If the build fails any *critical* test we refuse to
+    # deploy, send a Telegram alert with the failures, and return.
+    #
+    # "Critical" = Navigation, Form save, Render after save. The
+    # Persistence/Delete/Export tests are warned-on but not blocking —
+    # forge-generated apps occasionally have sub-flow quirks that don't
+    # warrant blocking shipment, and our test coverage of them isn't
+    # tight enough to be authoritative on its own.
+    # ------------------------------------------------------------------
+    print("  Functional QA: running jsdom-based gate…")
+    try:
+        run_functional_qa = _import_qa()
+        with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False) as tf:
+            tf.write(final_html)
+            qa_html_path = tf.name
+        try:
+            qa = run_functional_qa(slug, html_path=qa_html_path, timeout=90)
+        finally:
+            try: os.unlink(qa_html_path)
+            except OSError: pass
+    except Exception as e:
+        # If the QA infra itself is broken, fail closed.
+        msg = f"Forge QA INFRA FAILURE for *{name}* — refusing to deploy.\n{e}"
+        print(msg)
+        send_telegram(msg)
+        return
+
+    BLOCKING = {"Navigation", "Form save", "Render after save"}
+    blocking_fails = [t for t in qa.get("tests", []) if not t.get("ok") and t.get("name") in BLOCKING]
+    other_fails = [t for t in qa.get("tests", []) if not t.get("ok") and t.get("name") not in BLOCKING]
+
+    if blocking_fails:
+        bullet = "\n".join(f"  ✗ {t['name']} — {t.get('detail', '')}" for t in blocking_fails)
+        print(f"  QA FAILED — not deploying {name}")
+        print(bullet)
+        send_telegram(f"Forge QA FAILED for *{name}* — not deployed:\n{bullet}")
+        return
+
+    if other_fails:
+        warn = "; ".join(f"{t['name']}: {t.get('detail','')}" for t in other_fails)
+        print(f"  QA: critical tests passed; non-blocking warnings — {warn}")
+    else:
+        print(f"  QA: all functional tests passed")
 
     deploy(slug, final_html)
     add_nginx_route(slug, name)
